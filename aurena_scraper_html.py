@@ -13,19 +13,21 @@ Eigenschaften:
 - Mehrere Links gleichzeitig per ThreadPoolExecutor
 - Keine CSV-Dateien, keine Logdatei, keine Debug-Dateien
 - Nur eine HTML-Ausgabedatei
+- In der HTML-Datei gibt es einen Button zum Download der Daten als CSV
 - Reihenfolge in der HTML-Tabelle entspricht der Reihenfolge der Eingabedatei
 
 Benötigt:
     pip install requests beautifulsoup4
 
 Beispiel:
-    python aurena_scraper_html.py
-    python aurena_scraper_html.py aurenalinks.txt aurena_posten.html --workers 8 --delay 0.2
+    python aurena_scraper_html_with_csv_download.py
+    python aurena_scraper_html_with_csv_download.py aurenalinks.txt aurena_posten.html --workers 8 --delay 0.2
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import re
 import sys
@@ -35,7 +37,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,7 +47,7 @@ from urllib3.util.retry import Retry
 INPUT_FILE = Path("aurenalinks.txt")
 OUTPUT_FILE = Path("aurena_posten.html")
 REQUEST_DELAY_SECONDS = 0.0
-TOTAL_FACTOR = Decimal("1.416")
+TOTAL_FACTOR = Decimal("1.38")
 DEFAULT_TIMEOUT = 30
 DEFAULT_WORKERS = 5
 
@@ -183,13 +184,15 @@ def format_decimal_de(value: Decimal) -> str:
     return f"{quantized:.2f}".replace(".", ",")
 
 
-def get_text_tokens(soup: BeautifulSoup) -> list[str]:
-    tokens: list[str] = []
-    for s in soup.stripped_strings:
-        token = normalize_whitespace(str(s))
-        if token:
-            tokens.append(token)
-    return tokens
+def find_money_candidates(text: str) -> list[tuple[str, Decimal]]:
+    candidates: list[tuple[str, Decimal]] = []
+    for match in MONEY_TEXT_RE.finditer(text):
+        raw = clean_money_text(match.group(0))
+        try:
+            candidates.append((raw, parse_decimal_eur(raw)))
+        except ExtractionError:
+            continue
+    return candidates
 
 
 def extract_name(soup: BeautifulSoup) -> str:
@@ -214,17 +217,6 @@ def extract_name(soup: BeautifulSoup) -> str:
     raise ExtractionError("Name nicht gefunden")
 
 
-def find_money_candidates(text: str) -> list[tuple[str, Decimal]]:
-    candidates: list[tuple[str, Decimal]] = []
-    for match in MONEY_TEXT_RE.finditer(text):
-        raw = clean_money_text(match.group(0))
-        try:
-            candidates.append((raw, parse_decimal_eur(raw)))
-        except ExtractionError:
-            continue
-    return candidates
-
-
 def find_block_hint(text: str) -> str:
     lower_text = text.lower()
     for hint in REAL_BLOCK_HINTS:
@@ -239,7 +231,6 @@ def count_auction_markers(text: str) -> int:
 
 
 def build_diagnostics(soup: BeautifulSoup, text: str) -> PageDiagnostics:
-    tokens = get_text_tokens(soup)
     return PageDiagnostics(
         has_h1=soup.find("h1") is not None,
         bid_label_count=len(LABEL_BID_RE.findall(text)),
@@ -252,13 +243,10 @@ def build_diagnostics(soup: BeautifulSoup, text: str) -> PageDiagnostics:
 def infer_page_type(fetch_info: FetchInfo, diagnostics: PageDiagnostics) -> str:
     if "text/html" not in fetch_info.content_type.lower():
         return "non_html"
-
     if diagnostics.blocked_hint and diagnostics.auction_marker_count < 2 and not diagnostics.has_h1:
         return "blocked_or_challenge"
-
     if diagnostics.bid_label_count == 0 and diagnostics.money_candidate_count == 0:
         return "unexpected_page_structure"
-
     return "html"
 
 
@@ -397,72 +385,122 @@ def process_one(index: int, total: int, url: str, timeout: int, delay: float, wo
     except Exception as exc:
         return IndexedOutcome(index=index, url=url, row=None, error_message=f"{type(exc).__name__}: {exc}")
 
+def build_csv_text(rows: list[ScrapeRow]) -> str:
+    headers = [
+        "Name",
+        "URL",
+        "Aktuelles Gebot",
+        "Aktuelles Gebot inkl. 20% MwSt + 18% Auktionsgebühr",
+        "Ende der Auktion",
+    ]
+
+    def csv_escape(value: str) -> str:
+        text = value if value is not None else ""
+        return '"' + str(text).replace('"', '""') + '"'
+
+    lines = [';'.join(csv_escape(h) for h in headers)]
+    for row in rows:
+        lines.append(';'.join([
+            csv_escape(row.name),
+            csv_escape(row.url),
+            csv_escape(row.current_bid),
+            csv_escape(row.total_price),
+            csv_escape(row.end_datetime),
+        ]))
+    return "\ufeff" + "\r\n".join(lines)
+
 
 def make_html_document(rows: list[ScrapeRow], total_urls: int, failed_count: int) -> str:
     generated_at = time.strftime("%d.%m.%Y %H:%M:%S")
-    body_rows: list[str] = []
 
+    table_rows: list[str] = []
     for row in rows:
-        name_label = html.escape(row.name)
-        href = html.escape(row.url, quote=True)
-        body_rows.append(
+        name_html = f'<a href="{html.escape(row.url, quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(row.name)}</a>'
+        table_rows.append(
             "<tr>"
-            f"<td><a href=\"{href}\" target=\"_blank\" rel=\"noopener noreferrer\">{name_label}</a></td>"
+            f"<td>{name_html}</td>"
             f"<td class=\"num\">{html.escape(row.current_bid)}</td>"
             f"<td class=\"num\">{html.escape(row.total_price)}</td>"
             f"<td>{html.escape(row.end_datetime)}</td>"
             "</tr>"
         )
 
-    table_html = "\n".join(body_rows)
+    table_html = "\n".join(table_rows)
+
+    csv_link_html = '<span class="button disabled" aria-disabled="true">CSV herunterladen</span>'
+    if rows:
+        csv_text = build_csv_text(rows)
+        csv_b64 = base64.b64encode(csv_text.encode("utf-8")).decode("ascii")
+        csv_href = f"data:text/csv;charset=utf-8;base64,{csv_b64}"
+        csv_link_html = f'<a class="button" href="{csv_href}" download="aurena_posten.csv">CSV herunterladen</a>'
 
     return f"""<!DOCTYPE html>
-<html lang="de">
+<html lang=\"de\">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
   <title>Aurena Ergebnisse</title>
   <style>
     :root {{
-      color-scheme: light dark;
       --bg: #ffffff;
-      --fg: #1f2328;
-      --muted: #667085;
-      --border: #d0d7de;
-      --header: #f6f8fa;
-      --row-alt: #fafbfc;
-      --link: #0969da;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --header: #f8fafc;
+      --row-alt: #fcfcfd;
+      --link: #0f62fe;
+      --button-bg: #111827;
+      --button-text: #ffffff;
+      --button-disabled-bg: #9ca3af;
     }}
-    @media (prefers-color-scheme: dark) {{
-      :root {{
-        --bg: #0d1117;
-        --fg: #e6edf3;
-        --muted: #9da7b3;
-        --border: #30363d;
-        --header: #161b22;
-        --row-alt: #0f141b;
-        --link: #58a6ff;
-      }}
-    }}
+    * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: Arial, Helvetica, sans-serif;
-      background: var(--bg);
-      color: var(--fg);
+      color: var(--text);
+      background: #f5f7fb;
     }}
     .wrap {{
-      max-width: 1200px;
+      max-width: 1280px;
       margin: 0 auto;
       padding: 24px;
     }}
+    .topbar {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }}
     h1 {{
-      margin: 0 0 8px;
+      margin: 0 0 8px 0;
       font-size: 28px;
     }}
     .meta {{
       color: var(--muted);
-      margin-bottom: 18px;
+      font-size: 14px;
       line-height: 1.5;
+    }}
+    .button {{
+      display: inline-block;
+      background: var(--button-bg);
+      color: var(--button-text);
+      text-decoration: none;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+    }}
+    .button:hover {{
+      opacity: 0.92;
+      text-decoration: none;
+    }}
+    .button.disabled {{
+      background: var(--button-disabled-bg);
+      cursor: not-allowed;
+      pointer-events: none;
     }}
     .table-wrap {{
       overflow-x: auto;
@@ -510,19 +548,26 @@ def make_html_document(rows: list[ScrapeRow], total_urls: int, failed_count: int
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Aurena Ergebnisse</h1>
-    <div class="meta">
-      Erzeugt am {html.escape(generated_at)}<br>
-      Verarbeitete URLs: {total_urls} | Erfolgreich extrahiert: {len(rows)} | Fehler: {failed_count}
+  <div class=\"wrap\">
+    <div class=\"topbar\">
+      <div>
+        <h1>Aurena Ergebnisse</h1>
+        <div class=\"meta\">
+          Erzeugt am {html.escape(generated_at)}<br>
+          Verarbeitete URLs: {total_urls} | Erfolgreich extrahiert: {len(rows)} | Fehler: {failed_count}
+        </div>
+      </div>
+      <div>
+        {csv_link_html}
+      </div>
     </div>
-    <div class="table-wrap">
+    <div class=\"table-wrap\">
       <table>
         <thead>
           <tr>
             <th>Name</th>
             <th>Aktuelles Gebot</th>
-            <th>+20% MwSt +18% Geb.</th>
+            <th>Aktuelles Gebot inkl. 20% MwSt + 18% Auktionsgebühr</th>
             <th>Ende der Auktion</th>
           </tr>
         </thead>
@@ -535,6 +580,7 @@ def make_html_document(rows: list[ScrapeRow], total_urls: int, failed_count: int
 </body>
 </html>
 """
+
 
 
 def write_html(rows: list[ScrapeRow], path: Path, total_urls: int, failed_count: int) -> None:
