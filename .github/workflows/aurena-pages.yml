@@ -3,7 +3,8 @@ name: Aurena HTML aktualisieren
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
+      timezone: "Europe/Vienna"
 
 permissions:
   contents: read
